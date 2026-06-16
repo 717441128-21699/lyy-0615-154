@@ -143,6 +143,61 @@ def test_chain_propagation():
     check("释放后S2无持有者", s2.owner is None, f"got {s2.owner}")
 
 
+def test_chain_high_priority_first():
+    print("\n[3B] 嵌套链：高优先先等S1，持锁者随后等S2，S2持有者跟着升高")
+    graph = InheritanceGraph()
+    s1 = PriorityInheritanceLock("S1", graph=graph)
+    s2 = PriorityInheritanceLock("S2", graph=graph)
+
+    s1.acquire("A", 1)
+    s2.acquire("B", 5)
+
+    check("初始 A有效=1", s1.owner_effective_priority == 1,
+          f"got {s1.owner_effective_priority}")
+    check("初始 B有效=5", s2.owner_effective_priority == 5,
+          f"got {s2.owner_effective_priority}")
+
+    def c_waits_s1():
+        s1.acquire("C", 10, timeout=5)
+        time.sleep(0.05)
+        s1.release("C")
+
+    t_c = threading.Thread(target=c_waits_s1)
+    t_c.start()
+    time.sleep(0.2)
+
+    check("C等S1后 A提升到10",
+          s1.owner_effective_priority == 10,
+          f"got {s1.owner_effective_priority}")
+    check("C等S1后 B仍=5（链还没延伸到S2）",
+          s2.owner_effective_priority == 5,
+          f"got {s2.owner_effective_priority}")
+
+    def a_waits_s2():
+        s2.acquire("A", 1, timeout=5)
+        time.sleep(0.05)
+        s2.release("A")
+        s1.release("A")
+
+    t_a = threading.Thread(target=a_waits_s2)
+    t_a.start()
+    time.sleep(0.2)
+
+    check("A等S2后 B也被提升到10",
+          s2.owner_effective_priority == 10,
+          f"got {s2.owner_effective_priority}")
+    check("A等S2后 A仍=10",
+          s1.owner_effective_priority == 10,
+          f"got {s1.owner_effective_priority}")
+
+    s2.release("B")
+    t_a.join(timeout=2)
+    t_c.join(timeout=2)
+
+    check("完成后S1无持有者", s1.owner is None, f"got {s1.owner}")
+    check("完成后S2无持有者", s2.owner is None, f"got {s2.owner}")
+
+
 def test_chain_print():
     print("\n[4] 等待链可视化打印")
     graph = InheritanceGraph()
@@ -299,12 +354,12 @@ def test_ceiling_multi_lock_blocked():
     check("系统天花板 = 5", protocol.system_ceiling() == 5,
           f"got {protocol.system_ceiling()}")
 
-    r = lock_b.acquire("M", 3)
-    check("M(优先级3) 获取锁 B 被拒绝 (3 <= 天花板5)", r == ACQUIRE_BLOCKED,
+    r = lock_b.acquire("M", 2)
+    check("M(优先级2) 获取锁 B 被拒绝 (2 <= 天花板5)", r == ACQUIRE_BLOCKED,
           f"got {r}")
 
-    reason = protocol.explain_blocked("M", 3, "B")
-    check("explain_blocked 返回正确原因", "天花板=5" in reason and "≥" in reason and "3" in reason,
+    reason = protocol.explain_blocked("M", 2, "B")
+    check("explain_blocked 返回正确原因", "天花板=5" in reason and "≥" in reason and "2" in reason,
           f"got {reason}")
 
     r = lock_b.acquire("H", 8)
@@ -314,7 +369,7 @@ def test_ceiling_multi_lock_blocked():
     lock_b.release("H")
     lock_a.release("L")
 
-    r = lock_b.acquire("M", 3)
+    r = lock_b.acquire("M", 2)
     check("L释放后 M 可以获取锁 B", r == ACQUIRE_OK, f"got {r}")
     lock_b.release("M")
 
@@ -390,7 +445,7 @@ def test_ceiling_blocked_vs_timeout():
     lock_b = protocol.register_lock("B", 10)
 
     lock_a.acquire("X", 1)
-    r = lock_b.acquire("Y", 3, timeout=0.2)
+    r = lock_b.acquire("Y", 2, timeout=0.2)
     check("被天花板规则拒绝返回 ACQUIRE_BLOCKED", r == ACQUIRE_BLOCKED, f"got {r}")
 
     lock_a.release("X")
@@ -458,9 +513,11 @@ def test_reapply_inheritance_on_cancel():
 def test_scheduler_basic():
     print("\n[16] 调度器：三种模式下任务状态表正确")
     ops = {
-        "L": (1, 3, [("acquire", "S"), ("release", "S")]),
+        "L": (1, 3, [("release", "S")]),
         "H": (10, 2, [("acquire", "S"), ("release", "S")]),
     }
+    arrivals = {"L": 0, "H": 1}
+    initial_held = {"L": ["S"]}
     locks_config = {"S": 10}
 
     for mode in [MODE_NONE, MODE_INHERITANCE, MODE_CEILING]:
@@ -473,7 +530,11 @@ def test_scheduler_basic():
             sched.register_lock(name, cp)
 
         for tid, (pri, work, op_list) in ops.items():
-            sched.add_task(Task(tid, pri, work, op_list))
+            sched.add_task(Task(
+                tid, pri, work, op_list,
+                arrival_time=arrivals.get(tid, 0),
+                initial_held_locks=initial_held.get(tid, []),
+            ))
 
         sched.run(max_steps=20, verbose=False)
         summary = sched.get_summary()
@@ -485,10 +546,12 @@ def test_scheduler_basic():
 def test_scheduler_comparison():
     print("\n[17] 调度器：三种模式对比下高优任务等待时间差异")
     ops = {
-        "L": (1, 3, [("acquire", "S"), ("release", "S")]),
+        "L": (1, 3, [("release", "S")]),
         "M": (5, 5, []),
         "H": (10, 2, [("acquire", "S"), ("release", "S")]),
     }
+    arrivals = {"L": 0, "M": 2, "H": 3}
+    initial_held = {"L": ["S"]}
     locks_config = {"S": 10}
 
     wait_times = {}
@@ -503,7 +566,11 @@ def test_scheduler_comparison():
             sched.register_lock(name, cp)
 
         for tid, (pri, work, op_list) in ops.items():
-            sched.add_task(Task(tid, pri, work, op_list))
+            sched.add_task(Task(
+                tid, pri, work, op_list,
+                arrival_time=arrivals.get(tid, 0),
+                initial_held_locks=initial_held.get(tid, []),
+            ))
 
         sched.run(max_steps=30, verbose=False)
         summary = sched.get_summary()
@@ -532,13 +599,14 @@ def test_three_lock_ceiling():
     check("系统天花板 = min(3) = 3", protocol.system_ceiling() == 3,
           f"got {protocol.system_ceiling()}")
 
-    r = lock_y.acquire("M", 5)
-    check("M(5) 获取 Y 成功（5 > 其他被占用锁天花板3）", r == ACQUIRE_OK, f"got {r}")
-    check("系统天花板 = min(3,7) = 3", protocol.system_ceiling() == 3,
-          f"got {protocol.system_ceiling()}")
+    r = lock_y.acquire("M", 2)
+    check("M(2) 获取 Y 被拒绝（2 <= 系统天花板3）", r == ACQUIRE_BLOCKED, f"got {r}")
+    reason = protocol.explain_blocked("M", 2, "Y")
+    check("拦截依据含天花板3和优先级2", "3" in reason and "2" in reason,
+          f"got {reason}")
 
     r = lock_z.acquire("H", 8)
-    check("H(8) 获取 Z 成功（8 > 其他被占用锁天花板3）", r == ACQUIRE_OK, f"got {r}")
+    check("H(8) 获取 Z 成功（8 > 系统天花板3）", r == ACQUIRE_OK, f"got {r}")
 
     debug = protocol.debug_state()
     check("debug_state 包含所有锁信息",
@@ -546,8 +614,11 @@ def test_three_lock_ceiling():
           "缺少锁信息")
 
     lock_z.release("H")
-    lock_y.release("M")
     lock_x.release("L")
+
+    r = lock_y.acquire("M", 2)
+    check("L释放后 M 可以获取锁 Y", r == ACQUIRE_OK, f"got {r}")
+    lock_y.release("M")
 
 
 if __name__ == "__main__":
@@ -558,6 +629,7 @@ if __name__ == "__main__":
     test_duplicate_wait()
     test_ceiling_already_waiting()
     test_chain_propagation()
+    test_chain_high_priority_first()
     test_chain_print()
     test_wrong_release()
     test_release_ownership_transfer()

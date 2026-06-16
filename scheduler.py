@@ -16,12 +16,15 @@ TASK_DONE = "done"
 
 
 class Task:
-    def __init__(self, task_id, base_priority, work_units, lock_ops=None):
+    def __init__(self, task_id, base_priority, work_units, lock_ops=None,
+                 arrival_time=0, initial_held_locks=None):
         self.task_id = task_id
         self.base_priority = base_priority
         self.work_units = work_units
         self.remaining_work = work_units
         self.lock_ops = lock_ops or []
+        self.arrival_time = arrival_time
+        self.initial_held_locks = initial_held_locks or []
         self.state = TASK_READY
         self.held_locks = []
         self.waiting_for_lock = None
@@ -32,6 +35,7 @@ class Task:
         self.finish_time = None
         self.wait_start = None
         self.total_wait_time = 0
+        self._initial_locks_applied = False
 
     def get_priority(self):
         return self.effective_priority
@@ -120,7 +124,8 @@ class PriorityScheduler:
             task.effective_priority = self._get_effective_priority(task)
 
     def _get_runnable_tasks(self):
-        return [t for t in self.tasks if t.state == TASK_READY]
+        return [t for t in self.tasks
+                if t.state == TASK_READY and t.arrival_time <= self.current_time]
 
     def _pick_next_task(self):
         self._update_effective_priorities()
@@ -210,17 +215,18 @@ class PriorityScheduler:
 
     def _print_status_table(self):
         print(f"\n  [时间片 {self.current_time}] " + "=" * 60)
-        header = f"  {'任务':<6}{'基础':<6}{'有效':<6}{'状态':<10}{'持有锁':<15}{'等待锁':<10}{'原因':<15}"
+        header = f"  {'任务':<6}{'基础':<6}{'有效':<6}{'状态':<10}{'持有锁':<15}{'等待锁':<10}{'到达':<6}{'原因':<15}"
         print(header)
-        print("  " + "-" * 68)
+        print("  " + "-" * 74)
 
         for task in sorted(self.tasks, key=lambda t: -t.base_priority):
             held = ",".join(task.held_locks) if task.held_locks else "-"
             waiting = task.waiting_for_lock or "-"
             reason = task.blocked_reason or "-"
+            arrived = "✓" if task.arrival_time <= self.current_time else f"t={task.arrival_time}"
             print(
                 f"  {task.task_id:<6}{task.base_priority:<6}{task.effective_priority:<6}"
-                f"{task.state:<10}{held:<15}{waiting:<10}{reason:<15}"
+                f"{task.state:<10}{held:<15}{waiting:<10}{arrived:<6}{reason:<15}"
             )
 
         if self.mode == MODE_CEILING and self.ceiling_protocol:
@@ -245,6 +251,18 @@ class PriorityScheduler:
     def step(self, verbose=True):
         with self._lock:
             self.current_time += self.time_slice
+
+            for task in self.tasks:
+                if (not task._initial_locks_applied
+                        and task.arrival_time <= self.current_time
+                        and task.initial_held_locks):
+                    task._initial_locks_applied = True
+                    for lock_name in task.initial_held_locks:
+                        lock = self.locks.get(lock_name)
+                        if lock:
+                            result = lock.acquire(task.task_id, task.base_priority, timeout=-1)
+                            if result in ("acquired", "waiting"):
+                                task.held_locks.append(lock_name)
 
             current = self._pick_next_task()
             if current is None:
@@ -326,11 +344,13 @@ class PriorityScheduler:
         }
 
 
-def run_comparison(lock_ops_by_task, locks_config):
+def run_comparison(lock_ops_by_task, locks_config, arrivals=None, initial_held=None):
     print("\n" + "=" * 70)
     print("三种模式对比演示")
     print("=" * 70)
 
+    arrivals = arrivals or {}
+    initial_held = initial_held or {}
     modes = [MODE_NONE, MODE_INHERITANCE, MODE_CEILING]
 
     results = {}
@@ -346,7 +366,11 @@ def run_comparison(lock_ops_by_task, locks_config):
             sched.register_lock(lock_name, ceiling)
 
         for task_id, (priority, work, ops) in lock_ops_by_task.items():
-            task = Task(task_id, priority, work, ops)
+            task = Task(
+                task_id, priority, work, ops,
+                arrival_time=arrivals.get(task_id, 0),
+                initial_held_locks=initial_held.get(task_id, []),
+            )
             sched.add_task(task)
 
         sched.run(max_steps=15, verbose=True)

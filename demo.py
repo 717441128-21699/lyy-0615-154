@@ -42,7 +42,7 @@ def demo_priority_inversion():
 
 def demo_chain_propagation():
     print("\n" + "=" * 70)
-    print("场景二：嵌套锁 — 优先级沿等待链传递")
+    print("场景二：嵌套锁 — 优先级沿等待链传递（持锁者先等S2，高优后等S1）")
     print("=" * 70)
     print("  任务 A(优先级1) 持有锁S1，等待锁S2")
     print("  任务 B(优先级5) 持有锁S2")
@@ -103,37 +103,110 @@ def demo_chain_propagation():
     print(f"\n  ✅ 优先级沿等待链完整传递，加速了整个临界区的执行")
 
 
+def demo_chain_high_priority_first():
+    print("\n" + "=" * 70)
+    print("场景二B：嵌套锁 — 高优先等S1，持锁者随后等S2，S2持有者跟着升高")
+    print("=" * 70)
+    print("  执行顺序: A先持S1 → C先等S1(C看不到S2) → A随后去等S2 → B跟着被抬高")
+    print("  期望: A等S2后，链路 C→S1→A→S2→B 形成，B也被提升到10\n")
+
+    graph = InheritanceGraph()
+    s1 = PriorityInheritanceLock("S1", graph=graph)
+    s2 = PriorityInheritanceLock("S2", graph=graph)
+
+    s1.acquire("A", 1)
+    s2.acquire("B", 5)
+    print(f"  [初始] A(1) 获取 S1, B(5) 获取 S2")
+    print()
+
+    def c_waits_s1():
+        r = s1.acquire("C", 10, timeout=5)
+        print(f"\n  C 获取 S1: {_result_str(r)}")
+        if r == ACQUIRE_OK:
+            s1.release("C")
+
+    t_c = threading.Thread(target=c_waits_s1)
+    t_c.start()
+    time.sleep(0.2)
+
+    print(f"  [C 等待 S1] 此时A还没等S2，等待链只有 S1[A]:")
+    graph.print_chain(s1, "    ")
+    print(f"    S1 持有者 A 有效优先级: {s1.owner_effective_priority}")
+    print(f"    S2 持有者 B 有效优先级: {s2.owner_effective_priority}")
+    print(f"    → A被C提升到10，但B还是5（链还没延伸到S2）")
+    print()
+
+    def a_waits_s2():
+        r = s2.acquire("A", 1, timeout=5)
+        print(f"\n  A 获取 S2: {_result_str(r)}")
+        if r == ACQUIRE_OK:
+            s2.release("A")
+            s1.release("A")
+
+    t_a = threading.Thread(target=a_waits_s2)
+    t_a.start()
+    time.sleep(0.2)
+
+    print(f"  [A 等待 S2] 链路形成！C→S1[A]→S2[B]:")
+    graph.print_chain(s1, "    ")
+    print(f"    S1 持有者 A 有效优先级: {s1.owner_effective_priority}")
+    print(f"    S2 持有者 B 有效优先级: {s2.owner_effective_priority}")
+    print(f"    ✅ B 也被提升到 10！A等S2后链路延伸，优先级传到了B")
+
+    s2.release("B")
+    t_a.join(timeout=2)
+    t_c.join(timeout=2)
+    print(f"\n  ✅ 高优先等S1的场景下，持锁者随后等S2时，S2持有者确实跟着被抬高")
+
+
 def demo_already_waiting():
     print("\n" + "=" * 70)
-    print("场景三：重复等待状态 — 同一任务重复 acquire 返回明确状态")
+    print("场景三：重复等待状态 — 等待期间重复 acquire 返回 already_waiting")
     print("=" * 70)
-    print("  同一任务反复尝试获取同一把锁时，返回 'already_waiting' 而非 'timeout'\n")
+    print("  一个线程正在等待锁时，主线程重复调用同一任务 acquire 返回 'already_waiting'\n")
 
     lock = PriorityInheritanceLock("S")
     lock.acquire("A", 1)
     print(f"  A 获取锁 S")
 
-    results = []
-    for i in range(3):
-        r = lock.acquire("B", 5, timeout=0.05)
-        results.append(r)
-        print(f"  第 {i+1} 次 B 尝试获取 S: {_result_str(r)}")
+    thread_result = [None]
 
-    print(f"\n  三次结果: {results}")
-    check = results[0] in (ACQUIRE_TIMEOUT, ALREADY_WAITING) and results[1] == ALREADY_WAITING and results[2] == ALREADY_WAITING
-    print(f"  ✅ 第1次等待超时，第2-3次都返回 'already_waiting'，不会重复入队: {check}")
+    def b_wait():
+        thread_result[0] = lock.acquire("B", 5, timeout=5)
+        if thread_result[0] == ACQUIRE_OK:
+            lock.release("B")
+
+    t = threading.Thread(target=b_wait)
+    t.start()
+    time.sleep(0.1)
+
+    print(f"  [B 线程中等待] B 正在等待锁 S...")
+    r2 = lock.acquire("B", 5, timeout=0.1)
+    print(f"  第 1 次重复 acquire: {_result_str(r2)}")
+    r3 = lock.acquire("B", 5, timeout=0.1)
+    print(f"  第 2 次重复 acquire: {_result_str(r3)}")
+    r4 = lock.acquire("B", 5, timeout=0.1)
+    print(f"  第 3 次重复 acquire: {_result_str(r4)}")
+
+    print(f"\n  重复结果: r2={_result_str(r2)}, r3={_result_str(r3)}, r4={_result_str(r4)}")
+    all_already = r2 == ALREADY_WAITING and r3 == ALREADY_WAITING and r4 == ALREADY_WAITING
+    print(f"  ✅ 等待期间重复调用全部返回 'already_waiting': {all_already}")
 
     lock.release("A")
+    t.join(timeout=2)
+    r1 = thread_result[0]
+    print(f"  B 线程最终获取结果: {_result_str(r1)}")
+    print(f"  ✅ 原始等待线程正常获取锁，重复调用不影响等待状态")
 
 
 def demo_ceiling_multi_lock_detailed():
     print("\n" + "=" * 70)
     print("场景四：多锁天花板 — 动态系统天花板与拦截依据")
     print("=" * 70)
-    print("  锁 X: 天花板=3  (低优资源, 只能被低优任务使用)")
+    print("  锁 X: 天花板=3  (低优资源)")
     print("  锁 Y: 天花板=7  (中优资源)")
     print("  锁 Z: 天花板=10 (高优资源)")
-    print("  规则: 任务优先级 > 系统天花板 才能获取空闲锁\n")
+    print("  规则: 任务优先级 > 系统天花板 且 ≤ 锁天花板 才能获取空闲锁\n")
 
     protocol = PriorityCeilingProtocol()
     lock_x = protocol.register_lock("X", 3)
@@ -151,32 +224,32 @@ def demo_ceiling_multi_lock_detailed():
     print(f"  系统天花板 = min(3) = 3")
     print()
 
-    print("--- 步骤2: 任务 M(优先级5) 尝试获取锁 Y ---")
-    r = lock_y.acquire("M", 5)
+    print("--- 步骤2: 任务 M(优先级2) 尝试获取锁 Y ---")
+    r = lock_y.acquire("M", 2)
     print(f"  结果: {_result_str(r)}")
-    reason = protocol.explain_blocked("M", 5, "Y")
+    reason = protocol.explain_blocked("M", 2, "Y")
     print(f"  拦截依据: {reason}")
-    print(f"  验证: M优先级5 <= 系统天花板3? {5 <= 3} → 确实不满足")
+    print(f"  验证: M优先级2 ≤ 系统天花板3 → 不满足条件，被拦截")
     print()
 
-    print("--- 步骤3: 任务 H(优先级8) 尝试获取锁 Y ---")
-    r = lock_y.acquire("H", 8)
+    print("--- 步骤3: 任务 H(优先级6) 尝试获取锁 Y ---")
+    r = lock_y.acquire("H", 6)
     print(f"  结果: {_result_str(r)}")
-    print(f"  验证: H优先级8 > 系统天花板3 → 满足，允许获取")
+    print(f"  验证: H优先级6 > 系统天花板3 且 6 ≤ 锁Y天花板7 → 允许获取")
     print(protocol.debug_state())
-    print(f"  系统天花板 = min(3,10) = 3")
+    print(f"  系统天花板 = min(3,7) = 3")
     print()
 
     print("--- 步骤4: 任务 L 释放锁 X ---")
     lock_x.release("L")
     print(protocol.debug_state())
-    print(f"  系统天花板 = min(10) = 10")
+    print(f"  系统天花板 = min(7) = 7")
     print()
 
-    print("--- 步骤5: 任务 M(优先级5) 再次尝试获取锁 Y（Y仍被H持有）---")
-    r = lock_y.acquire("M", 5, timeout=0.2)
+    print("--- 步骤5: 任务 M(优先级2) 再试锁 Y（Y被H持有）---")
+    r = lock_y.acquire("M", 2, timeout=0.2)
     print(f"  结果: {_result_str(r)}")
-    print(f"  说明: Y被持有，M进入等待队列，不做天花板规则检查")
+    print(f"  说明: Y被持有，M进入等待队列（不做天花板规则检查），超时返回")
     print()
 
     print("--- 步骤6: 任务 H 释放锁 Y ---")
@@ -190,19 +263,20 @@ def demo_scheduler_comparison():
     print("\n" + "=" * 70)
     print("场景五：任务调度模拟器 — 三种模式时间片对比")
     print("=" * 70)
-    print("  经典优先级反转场景的调度对比:")
-    print("  L(1)  工作3: acquire S, work, release S")
-    print("  M(5)  工作5: 无锁操作（纯计算）")
-    print("  H(10) 工作3: acquire S, work, release S\n")
+    print("  L(1)  t=0到达, 初始持锁S, 工作3: release S")
+    print("  M(5)  t=2到达, 工作5: 无锁操作（纯计算，可抢占L）")
+    print("  H(10) t=3到达, 工作2: acquire S, release S\n")
 
     ops = {
-        "L": (1, 3, [("acquire", "S"), ("release", "S")]),
+        "L": (1, 3, [("release", "S")]),
         "M": (5, 5, []),
-        "H": (10, 3, [("acquire", "S"), ("release", "S")]),
+        "H": (10, 2, [("acquire", "S"), ("release", "S")]),
     }
+    arrivals = {"L": 0, "M": 2, "H": 3}
+    initial_held = {"L": ["S"]}
     locks_config = {"S": 10}
 
-    run_comparison(ops, locks_config)
+    run_comparison(ops, locks_config, arrivals=arrivals, initial_held=initial_held)
 
 
 def demo_nested_scheduler():
@@ -272,6 +346,7 @@ def demo_comparison():
 if __name__ == "__main__":
     demo_priority_inversion()
     demo_chain_propagation()
+    demo_chain_high_priority_first()
     demo_already_waiting()
     demo_ceiling_multi_lock_detailed()
     demo_scheduler_comparison()

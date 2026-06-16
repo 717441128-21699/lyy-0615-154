@@ -74,8 +74,6 @@ class InheritanceGraph:
                     print(
                         f"  [继承] {lock.name}: 任务 {owner} 优先级 {old} → {target_priority}"
                     )
-            else:
-                break
 
         return promoted
 
@@ -83,7 +81,6 @@ class InheritanceGraph:
         for lock in self._locks:
             if lock.owner is None:
                 continue
-
             base = lock._owner_base_priority
             if lock._owner_effective_priority != base:
                 old = lock._owner_effective_priority
@@ -93,9 +90,16 @@ class InheritanceGraph:
                     f" 优先级 {old} → {base}（恢复）"
                 )
 
-            if lock._waiters:
+        locks_with_waiters = []
+        for lock in self._locks:
+            if lock.owner is not None and lock._waiters:
                 highest = max(w.priority for w in lock._waiters.values())
-                self.boost_chain(lock, highest)
+                locks_with_waiters.append((lock, highest))
+
+        locks_with_waiters.sort(key=lambda x: -x[1])
+
+        for lock, highest in locks_with_waiters:
+            self.boost_chain(lock, highest)
 
     def print_chain(self, start_lock, indent="  "):
         chain = self.trace_chain(start_lock)
@@ -177,6 +181,8 @@ class PriorityInheritanceLock:
 
             if priority > (self._owner_effective_priority or 0):
                 self._graph.boost_chain(self, priority, source_task=task_id)
+
+            self._graph.reapply_all()
 
             if timeout is not None and timeout < 0:
                 return "waiting"
