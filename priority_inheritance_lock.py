@@ -1,54 +1,35 @@
 import threading
-from collections import defaultdict
+from collections import OrderedDict
+
+
+ACQUIRE_OK = "acquired"
+ACQUIRE_TIMEOUT = "timeout"
+ACQUIRE_CANCELLED = "cancelled"
+
+
+class WaiterEntry:
+    __slots__ = ("task_id", "priority", "event", "result")
+
+    def __init__(self, task_id, priority):
+        self.task_id = task_id
+        self.priority = priority
+        self.event = threading.Event()
+        self.result = None
 
 
 class PriorityInheritanceLock:
-    def __init__(self):
-        self._lock = threading.Lock()
+    def __init__(self, name="lock"):
+        self._name = name
+        self._internal = threading.Lock()
         self._owner = None
-        self._owner_original_priority = None
-        self._waiters = []
-        self._priority_map = {}
+        self._owner_base_priority = None
+        self._owner_effective_priority = None
+        self._waiters: OrderedDict[str, WaiterEntry] = OrderedDict()
+        self._held_locks_by_task: dict = {}
 
-    def acquire(self, task_id, priority):
-        self._priority_map[task_id] = priority
-
-        with self._lock:
-            if self._owner is None:
-                self._owner = task_id
-                self._owner_original_priority = priority
-                return True
-
-            self._waiters.append((task_id, priority))
-            self._waiters.sort(key=lambda x: -x[1])
-
-            if priority > self._owner_original_priority:
-                self._promote_owner(priority)
-
-            return False
-
-    def release(self, task_id):
-        with self._lock:
-            if self._owner != task_id:
-                raise RuntimeError(f"Task {task_id} does not own the lock")
-
-            if self._waiters:
-                next_task, next_priority = self._waiters.pop(0)
-                self._owner = next_task
-                self._owner_original_priority = self._priority_map[next_task]
-
-                if self._waiters:
-                    highest_waiter_priority = self._waiters[0][1]
-                    if highest_waiter_priority > self._owner_original_priority:
-                        self._promote_owner(highest_waiter_priority)
-            else:
-                self._owner = None
-                self._owner_original_priority = None
-
-    def _promote_owner(self, new_priority):
-        old_priority = self._owner_original_priority
-        self._owner_original_priority = new_priority
-        print(f"  [继承] 任务 {self._owner} 优先级从 {old_priority} 提升到 {new_priority}")
+    @property
+    def name(self):
+        return self._name
 
     @property
     def owner(self):
@@ -56,36 +37,131 @@ class PriorityInheritanceLock:
 
     @property
     def owner_effective_priority(self):
-        return self._owner_original_priority
+        return self._owner_effective_priority
 
+    def acquire(self, task_id, priority, timeout=None):
+        with self._internal:
+            if self._owner == task_id:
+                return ACQUIRE_OK
 
-class PriorityScheduler:
-    def __init__(self):
-        self._tasks = {}
-        self._lock = threading.Lock()
-        self._current_task = None
+            if self._owner is None:
+                self._owner = task_id
+                self._owner_base_priority = priority
+                self._owner_effective_priority = priority
+                self._register_hold(task_id)
+                return ACQUIRE_OK
 
-    def add_task(self, task_id, priority, func):
-        self._tasks[task_id] = {
-            'priority': priority,
-            'func': func,
-            'state': 'ready'
-        }
+            if task_id in self._waiters:
+                return self._waiters[task_id].result or ACQUIRE_TIMEOUT
 
-    def run(self):
-        ready_tasks = sorted(
-            [(tid, info) for tid, info in self._tasks.items() if info['state'] == 'ready'],
-            key=lambda x: -x[1]['priority']
-        )
+            entry = WaiterEntry(task_id, priority)
+            self._waiters[task_id] = entry
+            self._reorder_waiters()
 
-        if not ready_tasks:
-            return
+            if priority > self._owner_effective_priority:
+                self._boost_owner(priority)
 
-        current_id, current_info = ready_tasks[0]
-        self._current_task = current_id
-        current_info['state'] = 'running'
+        ok = entry.event.wait(timeout=timeout) if timeout is not None else entry.event.wait()
 
-        print(f"\n[调度] 运行任务 {current_id} (优先级 {current_info['priority']})")
-        current_info['func']()
-        current_info['state'] = 'done'
-        print(f"[调度] 任务 {current_id} 完成")
+        with self._internal:
+            if entry.result is not None:
+                return entry.result
+
+            if not ok:
+                if task_id in self._waiters:
+                    del self._waiters[task_id]
+                    self._reapply_inheritance()
+                entry.result = ACQUIRE_TIMEOUT
+                return ACQUIRE_TIMEOUT
+
+            if self._owner == task_id:
+                entry.result = ACQUIRE_OK
+                return ACQUIRE_OK
+
+            if task_id in self._waiters:
+                del self._waiters[task_id]
+                self._reapply_inheritance()
+            entry.result = ACQUIRE_CANCELLED
+            return ACQUIRE_CANCELLED
+
+    def release(self, task_id):
+        with self._internal:
+            if self._owner != task_id:
+                raise RuntimeError(
+                    f"任务 {task_id} 不是锁 {self._name} 的持有者"
+                    f"（当前持有者: {self._owner}）"
+                )
+
+            self._unregister_hold(task_id)
+
+            if self._waiters:
+                next_id, next_entry = next(iter(self._waiters.items()))
+                del self._waiters[next_id]
+
+                self._owner = next_id
+                self._owner_base_priority = next_entry.priority
+                self._owner_effective_priority = next_entry.priority
+                self._register_hold(next_id)
+
+                if self._waiters:
+                    highest = max(w.priority for w in self._waiters.values())
+                    if highest > self._owner_effective_priority:
+                        self._boost_owner(highest)
+
+                next_entry.result = ACQUIRE_OK
+                next_entry.event.set()
+            else:
+                self._owner = None
+                self._owner_base_priority = None
+                self._owner_effective_priority = None
+
+    def cancel(self, task_id):
+        with self._internal:
+            if task_id not in self._waiters:
+                return False
+            entry = self._waiters.pop(task_id)
+            entry.result = ACQUIRE_CANCELLED
+            entry.event.set()
+            self._reapply_inheritance()
+            return True
+
+    def _reorder_waiters(self):
+        items = sorted(self._waiters.items(), key=lambda kv: -kv[1].priority)
+        self._waiters = OrderedDict(items)
+
+    def _boost_owner(self, new_priority):
+        old = self._owner_effective_priority
+        self._owner_effective_priority = new_priority
+        print(f"  [继承] {self._name}: 任务 {self._owner} 优先级 {old} → {new_priority}")
+
+    def _reapply_inheritance(self):
+        if self._owner is not None and self._waiters:
+            highest = max(w.priority for w in self._waiters.values())
+            base = self._owner_base_priority
+            target = max(base, highest)
+            if target != self._owner_effective_priority:
+                self._boost_owner(target)
+        elif self._owner is not None:
+            if self._owner_effective_priority != self._owner_base_priority:
+                old = self._owner_effective_priority
+                self._owner_effective_priority = self._owner_base_priority
+                print(
+                    f"  [继承] {self._name}: 任务 {self._owner}"
+                    f" 优先级 {old} → {self._owner_base_priority}（恢复）"
+                )
+
+    def _register_hold(self, task_id):
+        if task_id not in self._held_locks_by_task:
+            self._held_locks_by_task[task_id] = []
+        self._held_locks_by_task[task_id].append(self)
+
+    def _unregister_hold(self, task_id):
+        if task_id in self._held_locks_by_task:
+            locks = self._held_locks_by_task[task_id]
+            if self in locks:
+                locks.remove(self)
+            if not locks:
+                del self._held_locks_by_task[task_id]
+
+    def get_held_locks(self, task_id):
+        return list(self._held_locks_by_task.get(task_id, []))
