@@ -5,8 +5,12 @@ import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-from priority_inheritance_lock import PriorityInheritanceLock, ACQUIRE_OK, ACQUIRE_TIMEOUT, ACQUIRE_CANCELLED
+from priority_inheritance_lock import (
+    PriorityInheritanceLock, InheritanceGraph,
+    ACQUIRE_OK, ACQUIRE_TIMEOUT, ACQUIRE_CANCELLED, ALREADY_WAITING
+)
 from priority_ceiling_lock import PriorityCeilingProtocol, ACQUIRE_BLOCKED
+from scheduler import Task, PriorityScheduler, MODE_NONE, MODE_INHERITANCE, MODE_CEILING
 
 
 passed = 0
@@ -24,24 +28,143 @@ def check(test_name, condition, detail=""):
 
 
 def test_duplicate_wait():
-    print("\n[1] 重复等待：同一任务多次 acquire 不应重复入队")
+    print("\n[1] 重复等待：同一任务在等待期间多次 acquire 返回 already_waiting")
     lock = PriorityInheritanceLock("T1")
     lock.acquire("A", 1)
 
-    results = []
-    for _ in range(3):
-        r = lock.acquire("B", 5, timeout=0.1)
-        results.append(r)
+    thread_r = []
+    def wait_thread():
+        r = lock.acquire("B", 5, timeout=2.0)
+        thread_r.append(r)
 
-    lock.release("A")
+    t = threading.Thread(target=wait_thread)
+    t.start()
     time.sleep(0.1)
 
-    first_timeout = results[0] == ACQUIRE_TIMEOUT
-    check("重复 acquire 返回 timeout", first_timeout, f"got {results}")
+    r2 = lock.acquire("B", 5, timeout=0.1)
+    r3 = lock.acquire("B", 5, timeout=0.1)
+
+    lock.release("A")
+    t.join()
+    r1 = thread_r[0]
+
+    check("第1次（线程中）获取成功",
+          r1 == ACQUIRE_OK,
+          f"got {r1}")
+    check("第2次返回 already_waiting",
+          r2 == ALREADY_WAITING,
+          f"got {r2}")
+    check("第3次返回 already_waiting",
+          r3 == ALREADY_WAITING,
+          f"got {r3}")
+
+    lock.release("B")
+
+
+def test_ceiling_already_waiting():
+    print("\n[2] 天花板锁重复等待：等待期间返回 already_waiting")
+    protocol = PriorityCeilingProtocol()
+    lock = protocol.register_lock("A", 10)
+    lock.acquire("X", 1)
+
+    thread_r = []
+    def wait_thread():
+        r = lock.acquire("Y", 5, timeout=2.0)
+        thread_r.append(r)
+
+    t = threading.Thread(target=wait_thread)
+    t.start()
+    time.sleep(0.1)
+
+    r2 = lock.acquire("Y", 5, timeout=0.1)
+    r3 = lock.acquire("Y", 5, timeout=0.1)
+
+    lock.release("X")
+    t.join()
+    r1 = thread_r[0]
+
+    check("第1次（线程中）获取成功", r1 == ACQUIRE_OK, f"got {r1}")
+    check("第2次返回 already_waiting", r2 == ALREADY_WAITING, f"got {r2}")
+    check("第3次返回 already_waiting", r3 == ALREADY_WAITING, f"got {r3}")
+
+    lock.release("Y")
+
+
+def test_chain_propagation():
+    print("\n[3] 嵌套锁：优先级沿等待链传递到链尾")
+    graph = InheritanceGraph()
+    s1 = PriorityInheritanceLock("S1", graph=graph)
+    s2 = PriorityInheritanceLock("S2", graph=graph)
+
+    s1.acquire("A", 1)
+    s2.acquire("B", 5)
+
+    check("S1初始有效优先级=1", s1.owner_effective_priority == 1,
+          f"got {s1.owner_effective_priority}")
+    check("S2初始有效优先级=5", s2.owner_effective_priority == 5,
+          f"got {s2.owner_effective_priority}")
+
+    def a_waits_s2():
+        s2.acquire("A", 1)
+        time.sleep(0.05)
+        s2.release("A")
+        s1.release("A")
+
+    t_a = threading.Thread(target=a_waits_s2)
+    t_a.start()
+    time.sleep(0.1)
+
+    check("A等待S2后 S1持有者A仍有效=1", s1.owner_effective_priority == 1,
+          f"got {s1.owner_effective_priority}")
+    check("A等待S2后 S2持有者B仍有效=5", s2.owner_effective_priority == 5,
+          f"got {s2.owner_effective_priority}")
+
+    def c_waits_s1():
+        s1.acquire("C", 10)
+        time.sleep(0.05)
+        s1.release("C")
+
+    t_c = threading.Thread(target=c_waits_s1)
+    t_c.start()
+    time.sleep(0.2)
+
+    check("C等待S1后 S1持有者A优先级提升到10",
+          s1.owner_effective_priority == 10,
+          f"got {s1.owner_effective_priority}")
+    check("C等待S1后 S2持有者B优先级也被提升到10",
+          s2.owner_effective_priority == 10,
+          f"got {s2.owner_effective_priority}")
+
+    s2.release("B")
+    t_a.join(timeout=2)
+    t_c.join(timeout=2)
+
+    check("释放后S1无持有者", s1.owner is None, f"got {s1.owner}")
+    check("释放后S2无持有者", s2.owner is None, f"got {s2.owner}")
+
+
+def test_chain_print():
+    print("\n[4] 等待链可视化打印")
+    graph = InheritanceGraph()
+    s1 = PriorityInheritanceLock("S1", graph=graph)
+    s2 = PriorityInheritanceLock("S2", graph=graph)
+
+    s1.acquire("A", 1)
+    s2.acquire("B", 5)
+
+    chain_str = None
+    try:
+        graph.print_chain(s1, "    ")
+        chain_ok = True
+    except Exception as e:
+        chain_ok = False
+        print(f"  打印失败: {e}")
+
+    check("等待链打印无异常", chain_ok)
 
 
 def test_wrong_release():
-    print("\n[2] 错误释放：非持有者释放应抛出异常")
+    print("\n[5] 错误释放：非持有者释放应抛出异常")
     lock = PriorityInheritanceLock("T2")
     lock.acquire("A", 1)
     try:
@@ -60,7 +183,7 @@ def test_wrong_release():
 
 
 def test_release_ownership_transfer():
-    print("\n[3] 释放归属：释放后锁只转交一个等待者")
+    print("\n[6] 释放归属：释放后锁只转交一个等待者")
     lock = PriorityInheritanceLock("T3")
     lock.acquire("A", 1)
 
@@ -71,7 +194,7 @@ def test_release_ownership_transfer():
         r = lock.acquire(tid, prio, timeout=5)
         results[tid] = r
         if r == ACQUIRE_OK:
-            time.sleep(0.1)
+            time.sleep(0.05)
             lock.release(tid)
 
     threads = [
@@ -100,7 +223,7 @@ def test_release_ownership_transfer():
 
 
 def test_timeout_wait():
-    print("\n[4] 超时等待：超时后返回 timeout，锁状态不变")
+    print("\n[7] 超时等待：超时后返回 timeout，锁状态不变")
     lock = PriorityInheritanceLock("T4")
     lock.acquire("A", 1)
 
@@ -114,7 +237,7 @@ def test_timeout_wait():
 
 
 def test_cancel_wait():
-    print("\n[5] 取消等待：cancel 后任务收到 cancelled 结果")
+    print("\n[8] 取消等待：cancel 后任务收到 cancelled 结果")
     lock = PriorityInheritanceLock("T5")
     lock.acquire("A", 1)
 
@@ -139,7 +262,7 @@ def test_cancel_wait():
 
 
 def test_inheritance_boost_and_restore():
-    print("\n[6] 优先级继承提升与恢复")
+    print("\n[9] 优先级继承提升与恢复")
     lock = PriorityInheritanceLock("T6")
     lock.acquire("L", 1)
     check("初始有效优先级为 1", lock.owner_effective_priority == 1,
@@ -166,7 +289,7 @@ def test_inheritance_boost_and_restore():
 
 
 def test_ceiling_multi_lock_blocked():
-    print("\n[7] 多锁天花板：不符合规则的获取被阻止")
+    print("\n[10] 多锁天花板：不符合规则的获取被阻止")
     protocol = PriorityCeilingProtocol()
     lock_a = protocol.register_lock("A", 5)
     lock_b = protocol.register_lock("B", 10)
@@ -179,6 +302,10 @@ def test_ceiling_multi_lock_blocked():
     r = lock_b.acquire("M", 3)
     check("M(优先级3) 获取锁 B 被拒绝 (3 <= 天花板5)", r == ACQUIRE_BLOCKED,
           f"got {r}")
+
+    reason = protocol.explain_blocked("M", 3, "B")
+    check("explain_blocked 返回正确原因", "天花板=5" in reason and "≥" in reason and "3" in reason,
+          f"got {reason}")
 
     r = lock_b.acquire("H", 8)
     check("H(优先级8) 获取锁 B 允许 (8 > 天花板5)", r == ACQUIRE_OK,
@@ -193,7 +320,7 @@ def test_ceiling_multi_lock_blocked():
 
 
 def test_ceiling_wrong_release():
-    print("\n[8] 天花板锁错误释放")
+    print("\n[11] 天花板锁错误释放")
     protocol = PriorityCeilingProtocol()
     lock = protocol.register_lock("X", 10)
     lock.acquire("A", 1)
@@ -208,7 +335,7 @@ def test_ceiling_wrong_release():
 
 
 def test_ceiling_system_ceiling_dynamic():
-    print("\n[9] 系统天花板动态变化")
+    print("\n[12] 系统天花板动态变化")
     protocol = PriorityCeilingProtocol()
     lock_a = protocol.register_lock("A", 3)
     lock_b = protocol.register_lock("B", 7)
@@ -235,7 +362,7 @@ def test_ceiling_system_ceiling_dynamic():
 
 
 def test_ceiling_same_task_multi_lock():
-    print("\n[10] 同一任务持有多个天花板锁")
+    print("\n[13] 同一任务持有多个天花板锁")
     protocol = PriorityCeilingProtocol()
     lock_a = protocol.register_lock("A", 5)
     lock_b = protocol.register_lock("B", 10)
@@ -256,8 +383,8 @@ def test_ceiling_same_task_multi_lock():
           f"got {len(protocol.get_held_locks('T'))}")
 
 
-def test_ceiling_timeout():
-    print("\n[11] 天花板锁：被规则拒绝 vs 持锁超时")
+def test_ceiling_blocked_vs_timeout():
+    print("\n[14] 天花板锁：被规则拒绝 vs 持锁超时")
     protocol = PriorityCeilingProtocol()
     lock_a = protocol.register_lock("A", 5)
     lock_b = protocol.register_lock("B", 10)
@@ -276,21 +403,25 @@ def test_ceiling_timeout():
 
 
 def test_reapply_inheritance_on_cancel():
-    print("\n[12] 取消等待后优先级恢复")
-    lock = PriorityInheritanceLock("T12")
+    print("\n[15] 取消等待后优先级恢复")
+    graph = InheritanceGraph()
+    lock = PriorityInheritanceLock("T12", graph=graph)
     lock.acquire("L", 1)
 
-    mid_acquired = threading.Event()
+    mid_result = [None]
 
     def mid_wait():
         r = lock.acquire("M", 5, timeout=5)
+        mid_result[0] = r
         if r == ACQUIRE_OK:
-            mid_acquired.set()
-            time.sleep(0.1)
+            time.sleep(0.05)
             lock.release("M")
+
+    high_result = [None]
 
     def high_wait():
         r = lock.acquire("H", 10, timeout=5)
+        high_result[0] = r
         if r == ACQUIRE_OK:
             time.sleep(0.05)
             lock.release("H")
@@ -324,12 +455,110 @@ def test_reapply_inheritance_on_cancel():
     lock.release("L")
 
 
+def test_scheduler_basic():
+    print("\n[16] 调度器：三种模式下任务状态表正确")
+    ops = {
+        "L": (1, 3, [("acquire", "S"), ("release", "S")]),
+        "H": (10, 2, [("acquire", "S"), ("release", "S")]),
+    }
+    locks_config = {"S": 10}
+
+    for mode in [MODE_NONE, MODE_INHERITANCE, MODE_CEILING]:
+        if mode == MODE_CEILING:
+            sched = PriorityScheduler(mode=mode, ceiling_config=locks_config)
+        else:
+            sched = PriorityScheduler(mode=mode)
+
+        for name, cp in locks_config.items():
+            sched.register_lock(name, cp)
+
+        for tid, (pri, work, op_list) in ops.items():
+            sched.add_task(Task(tid, pri, work, op_list))
+
+        sched.run(max_steps=20, verbose=False)
+        summary = sched.get_summary()
+
+        check(f"[{mode}] 调度器完成", summary["total_time"] > 0,
+              f"total_time={summary['total_time']}")
+
+
+def test_scheduler_comparison():
+    print("\n[17] 调度器：三种模式对比下高优任务等待时间差异")
+    ops = {
+        "L": (1, 3, [("acquire", "S"), ("release", "S")]),
+        "M": (5, 5, []),
+        "H": (10, 2, [("acquire", "S"), ("release", "S")]),
+    }
+    locks_config = {"S": 10}
+
+    wait_times = {}
+
+    for mode in [MODE_NONE, MODE_INHERITANCE, MODE_CEILING]:
+        if mode == MODE_CEILING:
+            sched = PriorityScheduler(mode=mode, ceiling_config=locks_config)
+        else:
+            sched = PriorityScheduler(mode=mode)
+
+        for name, cp in locks_config.items():
+            sched.register_lock(name, cp)
+
+        for tid, (pri, work, op_list) in ops.items():
+            sched.add_task(Task(tid, pri, work, op_list))
+
+        sched.run(max_steps=30, verbose=False)
+        summary = sched.get_summary()
+
+        for td in summary["tasks"]:
+            if td["id"] == "H":
+                wait_times[mode] = td["wait_time"]
+
+    check("无保护模式 H 等待时间最长",
+          wait_times[MODE_NONE] >= wait_times[MODE_INHERITANCE],
+          f"none={wait_times[MODE_NONE]}, inheritance={wait_times[MODE_INHERITANCE]}")
+    check("继承模式优于无保护",
+          wait_times[MODE_INHERITANCE] <= wait_times[MODE_NONE],
+          f"inheritance={wait_times[MODE_INHERITANCE]}, none={wait_times[MODE_NONE]}")
+
+
+def test_three_lock_ceiling():
+    print("\n[18] 三锁天花板：多锁占用时拦截依据一致")
+    protocol = PriorityCeilingProtocol()
+    lock_x = protocol.register_lock("X", 3)
+    lock_y = protocol.register_lock("Y", 7)
+    lock_z = protocol.register_lock("Z", 10)
+
+    r = lock_x.acquire("L", 1)
+    check("L 获取 X 成功", r == ACQUIRE_OK, f"got {r}")
+    check("系统天花板 = min(3) = 3", protocol.system_ceiling() == 3,
+          f"got {protocol.system_ceiling()}")
+
+    r = lock_y.acquire("M", 5)
+    check("M(5) 获取 Y 成功（5 > 其他被占用锁天花板3）", r == ACQUIRE_OK, f"got {r}")
+    check("系统天花板 = min(3,7) = 3", protocol.system_ceiling() == 3,
+          f"got {protocol.system_ceiling()}")
+
+    r = lock_z.acquire("H", 8)
+    check("H(8) 获取 Z 成功（8 > 其他被占用锁天花板3）", r == ACQUIRE_OK, f"got {r}")
+
+    debug = protocol.debug_state()
+    check("debug_state 包含所有锁信息",
+          "X" in debug and "Y" in debug and "Z" in debug,
+          "缺少锁信息")
+
+    lock_z.release("H")
+    lock_y.release("M")
+    lock_x.release("L")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("优先级反转防护锁 — 测试套件")
     print("=" * 60)
 
     test_duplicate_wait()
+    test_ceiling_already_waiting()
+    test_chain_propagation()
+    test_chain_print()
     test_wrong_release()
     test_release_ownership_transfer()
     test_timeout_wait()
@@ -339,8 +568,11 @@ if __name__ == "__main__":
     test_ceiling_wrong_release()
     test_ceiling_system_ceiling_dynamic()
     test_ceiling_same_task_multi_lock()
-    test_ceiling_timeout()
+    test_ceiling_blocked_vs_timeout()
     test_reapply_inheritance_on_cancel()
+    test_scheduler_basic()
+    test_scheduler_comparison()
+    test_three_lock_ceiling()
 
     print("\n" + "=" * 60)
     print(f"测试结果: {passed} 通过, {failed} 失败, 共 {passed + failed} 项")
